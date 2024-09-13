@@ -18,11 +18,12 @@ SRC_DIRS=(
 EXCLUDE_DIRS=('mysql' 'xray-core') # Директории которые будут исключены из бэкапа
 BACKUP_DIR='/root/backup' # Место где будет собираться бэкап файлов
 
-# Переменные для Docker MySQL
-USE_DOCKER_MYSQL='yes'  # Установите 'yes', если хотите использовать Docker MySQL
-DOCKER_CONTAINER_NAME='mysql_container'  # Имя или ID Docker-контейнера MySQL
+# Переменные для Docker MySQL/MariaDB
+USE_DOCKER_MYSQL='yes'  # Установите 'yes', если хотите использовать Docker MySQL/MariaDB
+DOCKER_CONTAINER_NAME='mysql_container'  # Имя или ID Docker-контейнера MySQL/MariaDB
 MYSQL_USER='root'
 MYSQL_PASSWORD='your_password'  # Рекомендуется использовать переменные окружения или файл настроек для пароля
+DB_TYPE='mysql'  # Установите 'mysql' или 'mariadb'
 
 SERVER_IP=$(curl -s ifconfig.me)
 
@@ -67,22 +68,54 @@ send_backup_to_telegram() {
     fi
 }
 
-# Функция для резервного копирования базы данных MySQL
+# Функция для резервного копирования базы данных MySQL/MariaDB
 backup_mysql() {
     local total_size=0
+    # Определяем команду для дампа в зависимости от типа базы данных
+    local DUMP_COMMAND
+    local CLIENT_PACKAGE
+    if [ "$DB_TYPE" == 'mysql' ]; then
+        DUMP_COMMAND='mysqldump'
+        CLIENT_PACKAGE='mysql-client'
+    elif [ "$DB_TYPE" == 'mariadb' ]; then
+        DUMP_COMMAND='mariadb-dump'
+        CLIENT_PACKAGE='mariadb-client'
+    else
+        echo "Unsupported DB_TYPE: $DB_TYPE"
+        send_telegram_message "❗ Unsupported DB_TYPE: <code>$DB_TYPE</code>."
+        exit 1
+    fi
+
+    # Проверка и установка клиента в контейнере
+    if [ "$USE_DOCKER_MYSQL" == 'yes' ]; then
+        # Проверяем, установлен ли клиент в контейнере
+        if ! docker exec "$DOCKER_CONTAINER_NAME" command -v "$DUMP_COMMAND" &> /dev/null; then
+            echo "Клиент $DUMP_COMMAND не найден в контейнере. Установка..."
+            docker exec "$DOCKER_CONTAINER_NAME" apt-get update
+            docker exec "$DOCKER_CONTAINER_NAME" apt-get install -y "$CLIENT_PACKAGE"
+        fi
+    else
+        # Проверяем, установлен ли клиент локально
+        if ! command -v "$DUMP_COMMAND" &> /dev/null; then
+            echo "Клиент $DUMP_COMMAND не найден локально. Установка..."
+            apt-get update
+            apt-get install -y "$CLIENT_PACKAGE"
+        fi
+    fi
+
     for DB_NAME in "${DB_NAMES[@]}"; do
-        echo "Starting MySQL backup for $DB_NAME..."
+        echo "Starting $DB_TYPE backup for $DB_NAME..."
         mkdir -p "$DB_BACKUP_DIR"
         local SQL_FILE="$DB_BACKUP_DIR/db_${DB_NAME}.sql"
-        local DB_DUMP_NAME="MySQL-$DB_NAME-$DATE.tar.gz"
+        local DB_DUMP_NAME="${DB_TYPE^}-$DB_NAME-$DATE.tar.gz"
         local DB_DUMP_PATH="$DB_BACKUP_DIR/$DB_DUMP_NAME"
 
         if [ "$USE_DOCKER_MYSQL" == 'yes' ]; then
-            # Используем mysqldump внутри Docker-контейнера
-            docker exec -i "$DOCKER_CONTAINER_NAME" mysqldump -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$DB_NAME" > "$SQL_FILE"
+            # Используем команду дампа внутри Docker-контейнера
+            docker exec -i "$DOCKER_CONTAINER_NAME" "$DUMP_COMMAND" -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$DB_NAME" > "$SQL_FILE"
         else
-            # Локальный mysqldump
-            mysqldump --defaults-file=~/.my.cnf "$DB_NAME" > "$SQL_FILE"
+            # Локальный дамп
+            "$DUMP_COMMAND" --defaults-file=~/.my.cnf "$DB_NAME" > "$SQL_FILE"
         fi
 
         if [ -f "$SQL_FILE" ]; then
@@ -90,9 +123,9 @@ backup_mysql() {
             local size=$(stat -c%s "$DB_DUMP_PATH")
             total_size=$((total_size + size))
             rm "$SQL_FILE"
-            echo "MySQL backup for $DB_NAME completed!"
+            echo "$DB_TYPE backup for $DB_NAME completed!"
         else
-            echo "MySQL backup for $DB_NAME failed!"
+            echo "$DB_TYPE backup for $DB_NAME failed!"
             send_telegram_message "❗ Ошибка при создании дампа базы данных <code>$DB_NAME</code>."
         fi
     done
@@ -112,8 +145,18 @@ if ! tar czvf "$ARCHIVE_PATH" "${EXCLUDE_ARGS[@]}" -C / "${SRC_DIRS[@]}"; then
     exit 1
 fi
 
+# Проверка размера архива файлов
+archive_size=$(stat -c%s "$ARCHIVE_PATH")
+
 # Выполнение резервного копирования баз данных и получение общего размера
 total_db_size=$(backup_mysql)
+
+# Проверка, что total_db_size является числом
+if ! [[ "$total_db_size" =~ ^[0-9]+$ ]]; then
+    total_db_size=0
+fi
+
+total_size=$((archive_size + total_db_size))
 
 # Список папок и баз данных для сообщения
 folder_list=''
@@ -151,7 +194,7 @@ fi
 
 # Загрузка архивов дампов баз данных в Cloudflare R2
 for DB_NAME in "${DB_NAMES[@]}"; do
-    DB_DUMP_NAME="MySQL-$DB_NAME-$DATE.tar.gz"
+    DB_DUMP_NAME="${DB_TYPE^}-$DB_NAME-$DATE.tar.gz"
     DB_DUMP_PATH="$DB_BACKUP_DIR/$DB_DUMP_NAME"
     if [ -f "$DB_DUMP_PATH" ]; then
         if rclone copy "$DB_DUMP_PATH" "$TARGET_DIR"; then
